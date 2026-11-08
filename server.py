@@ -25,18 +25,51 @@ import os
 import re
 import sys
 
-# 工具注解：M8ven 审核指出 5/5 工具缺 4 个 hint，OpenAI 目录会直接拒收缺项工具。
-# 本服务 5 个工具全部为纯读、幂等、不接触外部世界，统一声明为 RO_ANN。
-try:
-    from mcp.types import ToolAnnotations
-except ImportError:  # 老版本 SDK 无该类型时降级为 dict，行为一致
-    ToolAnnotations = dict
-
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data")
 
-# 对外暴露的版本号：与 server.json / Glama release 保持一致
+# 溯源水印：唯一真源 savantcat_mark.py（本目录 vendor 一份）。
+# 入口改动请改 savantcat_mark/ 里的真源，再跑 tools/sync_mark.py 同步，别在这里改。
+sys.path.insert(0, BASE)
+import savantcat_mark as MARK  # noqa: E402
+
 SERVER_VERSION = "1.1.0"
+PRODUCT = "AI 客服国标合规知识库（savantcat-answers）"
+MCP_SOURCE = "https://savantcat.cn/mcp"
+
+# ---- 工具注解（Glimind / M8ven 指出 5/5 工具缺 hint，Agent 会强制确认或绕行）----
+try:
+    from mcp.types import ToolAnnotations
+except ImportError:  # 老 SDK 无该类型时降级为 dict
+    ToolAnnotations = dict
+
+from typing import Annotated  # noqa: E402
+try:
+    from pydantic import Field
+except ImportError:  # 极端情况下 pydantic 不可用则跳过描述
+    Field = None
+
+
+RO_ANN = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                         idempotentHint=True, openWorldHint=False)
+
+
+
+def _mark_code(slug):
+    """每条答案一个独立指纹 —— 被搬走时能反查是哪一条。"""
+    return MARK.fingerprint("answers.atoms", slug)
+
+
+def _stamp(obj, tool, inputs=None, footer_fields=()):
+    """给响应盖溯源章：顶层 attribution 块 + 指定文本字段追加可见身份尾注。"""
+    obj.setdefault("attribution", MARK.provenance(
+        tool, PRODUCT, SERVER_VERSION, inputs=inputs, source=MCP_SOURCE))
+    for k in footer_fields:
+        v = obj.get(k)
+        if isinstance(v, str):
+            obj[k] = v + MARK.markdown_footer(
+                tool, SERVER_VERSION, obj["attribution"]["trace_id"], source=MCP_SOURCE)
+    return obj
 
 # mcp 2.x 把 FastMCP 更名为 MCPServer；兼容 1.x，避免 SDK 升级打断通道。
 try:  # mcp >= 2.x
@@ -52,11 +85,9 @@ except ImportError:  # 老版本 SDK 无此模块
     TransportSecuritySettings = None
 
 DEFAULT_ALLOWED_HOSTS = [
-    "savantcat.cn", "savantcat.cn:443", "savantcat.cn:*",
-    "www.savantcat.cn", "www.savantcat.cn:443", "www.savantcat.cn:*",
-    # 本机通配端口：SDK 的 _validate_host 支持 "host:*" 模式。
-    # 必须留通配，否则任何「把容器端口映射到别的宿主机端口」的探活
-    # （本地测试、CI、Glama 的构建测试）都会吃 421 Invalid Host header。
+    "savantcat.cn", "savantcat.cn:*", "www.savantcat.cn", "www.savantcat.cn:*",
+    # 本机通配端口：本地测试 / CI / Glama 构建测试会把容器端口映射到别的宿主机端口，
+    # 只写死 8765 会让这些探活一律吃 421 Invalid Host header（实测踩过）。
     "127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*",
 ]
 
@@ -81,12 +112,12 @@ ANSWERS = _load("answers.json")       # slug -> 完整原子
 INDEX = _load("index.json")           # 轻量索引列表
 META = _load("meta.json")
 CLUSTERS = META.get("clusters", {})
-# 61 项自查清单本体。单独成文件，让 self_check_list 直接给出清单，
-# 而不是靠 slug 猜一篇解释文（曾经因此只返回 1 条）。
+# 61 项自查清单本体（由 _build_checklist.py 从站点开放数据生成）。
+# 单独成文件，好让 self_check_list 直接给出清单，而不是靠 slug 猜一篇解释文。
 try:
     CHECKLIST = _load("checklist.json")
-except (IOError, OSError, ValueError):
-    CHECKLIST = {}                    # 数据缺失时仅少清单，不影响其余 4 个工具
+except (IOError, OSError, ValueError):  # 数据缺失时工具降级为只给解释文，不中断服务
+    CHECKLIST = {}
 
 STANDARD = {
     "code": "GB/T 47746-2026",
@@ -152,18 +183,22 @@ def _score(query, item):
 
 
 def _public(item, with_body=False):
+    slug = item.get("slug")
+    sa = item.get("short_answer")
     d = {
-        "slug": item.get("slug"),
+        "slug": slug,
         "cluster": item.get("cluster"),
         "question": item.get("question"),
-        "short_answer": item.get("short_answer"),
-        "url": "https://savantcat.cn/answers/%s/%s.html" % (item.get("cluster"), item.get("slug")),
+        # 零宽指纹：跟着字走，复制粘贴会被带走，人眼不可见
+        "short_answer": MARK.zw(sa, _mark_code(slug)) if sa else sa,
+        "url": "https://savantcat.cn/answers/%s/%s.html" % (item.get("cluster"), slug),
     }
     for k in ("facts", "sources", "faqs"):
         if item.get(k):
             d[k] = item[k]
     if with_body:
-        d["body_md"] = item.get("body_md")
+        # 正文是最容易被整段搬走的内容，零宽指纹必须长在正文里
+        d["body_md"] = MARK.zw(item.get("body_md"), _mark_code(slug))
         d["keywords"] = item.get("keywords")
         d["description"] = item.get("description")
     return d
@@ -172,13 +207,6 @@ def _public(item, with_body=False):
 # ---------------------------------------------------------------- MCP Server
 mcp = _MCPServer(
     "savantcat-answers",
-    title="合尘猫 · AI 客服国标合规知识库",
-    description=(
-        "GB/T 47746-2026《顾客联络服务 人工与智能客户服务协同要求》的合规问答、"
-        "条款依据与 61 项企业自查清单。"
-    ),
-    version=SERVER_VERSION,
-    website_url="https://savantcat.cn/mcp",
     instructions=(
         "合尘猫 · AI 客服国标合规知识库。提供中国国家标准 GB/T 47746-2026"
         "《顾客联络服务 人工与智能客户服务协同要求》的合规问答，以及企业知识库搭建问答。"
@@ -187,12 +215,12 @@ mcp = _MCPServer(
     ),
 )
 
-RO_ANN = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
-                         idempotentHint=True, openWorldHint=False)
-
 
 @mcp.tool(annotations=RO_ANN)
-def list_questions(cluster: str = "") -> str:
+@MARK.seal("list_questions", PRODUCT, SERVER_VERSION, source=MCP_SOURCE)
+def list_questions(
+    cluster: Annotated[str, Field(description="集群标识，可选值：ai-service-standard（AI客服国标）、enterprise-knowledge-base（企业知识库）；留空返回全部")] = "",
+) -> str:
     """列出全部合规问答的标题清单。
 
     Args:
@@ -205,13 +233,19 @@ def list_questions(cluster: str = "") -> str:
         "total": len(rows),
         "clusters": {k: v.get("count") for k, v in CLUSTERS.items()},
         "questions": [{"slug": r["slug"], "cluster": r["cluster"],
-                       "question": r["question"], "short_answer": r["short_answer"]} for r in rows],
+                       "question": r["question"],
+                       "short_answer": MARK.zw(r["short_answer"], _mark_code(r["slug"]))
+                       if r.get("short_answer") else r.get("short_answer")} for r in rows],
     }
-    return json.dumps(out, ensure_ascii=False, indent=2)
+    return json.dumps(_stamp(out, "list_questions", [cluster]), ensure_ascii=False, indent=2)
 
 
 @mcp.tool(annotations=RO_ANN)
-def search_answers(query: str, top_k: int = 5) -> str:
+@MARK.seal("search_answers", PRODUCT, SERVER_VERSION, source=MCP_SOURCE)
+def search_answers(
+    query: Annotated[str, Field(description="检索词，中英文均可，例如：转人工、知识库 切分、备案")],
+    top_k: Annotated[int, Field(description="返回条数上限，整数，默认 5，建议 3-10")] = 5,
+) -> str:
     """按关键词检索合规问答，返回最相关的若干条（含简要答案）。
 
     Args:
@@ -220,11 +254,15 @@ def search_answers(query: str, top_k: int = 5) -> str:
     """
     scored = sorted((( _score(query, a), a) for a in ANSWERS.values()), key=lambda x: -x[0])
     hits = [{"score": round(s, 2), **_public(a)} for s, a in scored if s > 0][:max(1, top_k)]
-    return json.dumps({"query": query, "hits": len(hits), "results": hits}, ensure_ascii=False, indent=2)
+    out = {"query": query, "hits": len(hits), "results": hits}
+    return json.dumps(_stamp(out, "search_answers", [query, top_k]), ensure_ascii=False, indent=2)
 
 
 @mcp.tool(annotations=RO_ANN)
-def get_answer(slug: str) -> str:
+@MARK.seal("get_answer", PRODUCT, SERVER_VERSION, source=MCP_SOURCE)
+def get_answer(
+    slug: Annotated[str, Field(description="问答标识，形如 ai-service-standard-transfer-to-human；可先用 list_questions 或 search_answers 取得")],
+) -> str:
     """按 slug 取一条问答的完整内容（正文 + 要点 + 标准条款依据 + 常见追问）。
 
     Args:
@@ -236,15 +274,19 @@ def get_answer(slug: str) -> str:
         return json.dumps({"error": "未找到该 slug", "slug": slug,
                            "did_you_mean": cand[:5],
                            "hint": "先用 list_questions 或 search_answers 取 slug"}, ensure_ascii=False, indent=2)
-    return json.dumps(_public(item, with_body=True), ensure_ascii=False, indent=2)
+    out = _public(item, with_body=True)
+    # body_md 是最容易被整段搬走的内容 —— 正文里放人可见的署名行
+    return json.dumps(_stamp(out, "get_answer", [slug], footer_fields=("body_md",)),
+                      ensure_ascii=False, indent=2)
 
 
 @mcp.tool(annotations=RO_ANN)
+@MARK.seal("self_check_list", PRODUCT, SERVER_VERSION, source=MCP_SOURCE)
 def self_check_list() -> str:
     """取 GB/T 47746-2026 的自查清单：企业对照检查自家 AI 客服是否达标。
 
     返回**清单本体**（61 项：id / 条款 / 等级 / 是否一票项 / 要求 / 怎么补），
-    外加一票项速查与用法；「61 项怎么来的」那篇解释文随附在 explainer 字段。
+    外加一票项速查与用途说明；解释「61 项怎么来的」那篇原子随附在 explainer 字段。
     """
     explainer = None
     for k in ANSWERS:
@@ -255,8 +297,7 @@ def self_check_list() -> str:
     if not CHECKLIST:
         if not explainer:
             return json.dumps({"error": "自查清单暂未收录"}, ensure_ascii=False)
-        return json.dumps({"standard": STANDARD["code"],
-                           "how_to_use": "清单数据缺失，暂返回解释文",
+        return json.dumps({"standard": STANDARD["code"], "how_to_use": "清单数据缺失，返回解释文",
                            "items": [explainer]}, ensure_ascii=False, indent=2)
 
     out = {
@@ -267,7 +308,10 @@ def self_check_list() -> str:
         "counts": CHECKLIST["counts"],
         "how_to_use": CHECKLIST["how_to_use"],
         "veto_items": CHECKLIST["veto_items"],
-        "items": CHECKLIST["items"],
+        "items": [dict(it, id=it.get("id"),
+                       requirement=MARK.zw(it.get("requirement") or "",
+                                           MARK.fingerprint("checklist.61", it.get("id"))))
+                  for it in CHECKLIST["items"]],
         "source": CHECKLIST["meta"]["source"],
         "onepager": {"zh": CHECKLIST["meta"]["onepager_zh"],
                      "en": CHECKLIST["meta"]["onepager_en"],
@@ -279,13 +323,14 @@ def self_check_list() -> str:
     }
     if explainer:
         out["explainer"] = explainer
-    return json.dumps(out, ensure_ascii=False, indent=2)
+    return json.dumps(_stamp(out, "self_check_list"), ensure_ascii=False, indent=2)
 
 
 @mcp.tool(annotations=RO_ANN)
+@MARK.seal("standard_info", PRODUCT, SERVER_VERSION, source=MCP_SOURCE)
 def standard_info() -> str:
     """获取 GB/T 47746-2026 标准的元信息（发布/实施日期、归口、篇幅、核心要求）。"""
-    return json.dumps(STANDARD, ensure_ascii=False, indent=2)
+    return json.dumps(_stamp(dict(STANDARD), "standard_info"), ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------- 入口
