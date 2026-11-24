@@ -13,6 +13,8 @@
 [![API Key](https://img.shields.io/badge/API%20Key-不需要-success)](https://savantcat.cn/mcp)
 [![Tools](https://img.shields.io/badge/tools-5-orange)](https://savantcat.cn/mcp)
 [![M8ven Score](https://m8ven.ai/badge/mcp/savantcat/savantcat-answers-mcp)](https://m8ven.ai/mcp/savantcat/savantcat-answers-mcp?s=readme)
+[![Glama](https://glama.ai/mcp/servers/savantcat/savantcat-answers-mcp/badges/score.svg)](https://glama.ai/mcp/servers/savantcat/savantcat-answers-mcp)
+[![mcptry](https://mcptry.com/badge/cn.savantcat/answers)](https://mcptry.com/servers/cn.savantcat/answers)
 
 ### 为什么值得接
 
